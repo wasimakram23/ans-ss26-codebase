@@ -23,7 +23,7 @@
 
 from mininet.topo import Topo
 from mininet.net import Mininet
-from mininet.node import RemoteController, OVSKernelSwitch
+from mininet.node import RemoteController, OVSKernelSwitch, OVSSwitch
 from mininet.link import TCLink
 from mininet.cli import CLI
 from mininet.log import setLogLevel
@@ -36,11 +36,24 @@ class NetworkTopo(Topo):
         Topo.__init__(self)
 
         # Build the specified network topology here
+        # Hosts
+        h1 = self.addHost('h1')
+        h2 = self.addHost('h2')
+        ser = self.addHost('ser')
+
+        # Switches as pure bridges
+        s1 = self.addSwitch('s1',cls=OVSKernelSwitch)
+        s2 = self.addSwitch('s2',cls=OVSKernelSwitch)
+
+        # Host–switch links
+        self.addLink(h1, s1, bw=15, delay='10ms')
+        self.addLink(h2, s1, bw=15, delay='10ms')
+        self.addLink(ser, s2, bw=15, delay='10ms')
+        self.addLink(s1, s2, bw=20, delay='10ms')
 
 def run():
     topo = NetworkTopo()
     net = Mininet(topo=topo,
-                  switch=OVSKernelSwitch,
                   link=TCLink,
                   controller=None)
     net.addController(

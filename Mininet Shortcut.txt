@@ -1,0 +1,4 @@
+#clean mininet network before starting a new one
+
+import os
+os.system('mn -c')
