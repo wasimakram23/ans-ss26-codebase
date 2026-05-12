@@ -35,21 +35,33 @@ class NetworkTopo(Topo):
 
         Topo.__init__(self)
 
-        # Build the specified network topology here
-        # Hosts
-        h1 = self.addHost('h1')
-        h2 = self.addHost('h2')
-        ser = self.addHost('ser')
+        # host
+        h1 = self.addHost('h1', ip='10.0.1.2/24', defaultRoute='via 10.0.1.1')
+        h2 = self.addHost('h2', ip='10.0.1.3/24', defaultRoute='via 10.0.1.1')
+        ser = self.addHost('ser', ip='10.0.2.2/24', defaultRoute='via 10.0.2.1')
+        ext = self.addHost('ext', ip='192.168.1.123/24', defaultRoute='via 192.168.1.1')
 
-        # Switches as pure bridges
-        s1 = self.addSwitch('s1',cls=OVSKernelSwitch)
-        s2 = self.addSwitch('s2',cls=OVSKernelSwitch)
+        # switch
+        s1 = self.addSwitch('s1', cls=OVSSwitch)
+        s2 = self.addSwitch('s2', cls=OVSSwitch)
 
-        # Host–switch links
-        self.addLink(h1, s1, bw=15, delay='10ms')
-        self.addLink(h2, s1, bw=15, delay='10ms')
-        self.addLink(ser, s2, bw=15, delay='10ms')
-        self.addLink(s1, s2, bw=20, delay='10ms')
+        # router
+        s3 = self.addSwitch('s3',cls=OVSSwitch)
+
+        link_opt = dict(bw=15, delay='10ms')
+        # creating host links
+        self.addLink(h1,s1,cls=TCLink,**link_opt)
+        self.addLink(h2,s1,cls=TCLink,**link_opt)
+
+        #creating int server link
+        self.addLink(ser, s2, cls=TCLink, **link_opt)
+
+        # creating router link
+        self.addLink(s1, s3, cls=TCLink, **link_opt)
+        self.addLink(s2, s3, cls=TCLink, **link_opt)
+        self.addLink(ext, s3, cls=TCLink, **link_opt)
+
+
 
 def run():
     topo = NetworkTopo()
