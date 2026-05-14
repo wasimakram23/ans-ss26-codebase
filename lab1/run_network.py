@@ -42,11 +42,11 @@ class NetworkTopo(Topo):
         ext = self.addHost('ext', ip='192.168.1.123/24', defaultRoute='via 192.168.1.1')
 
         # switch
-        s1 = self.addSwitch('s1', cls=OVSSwitch)
-        s2 = self.addSwitch('s2', cls=OVSSwitch)
+        s1 = self.addSwitch('s1', cls=OVSSwitch, dpid='1')
+        s2 = self.addSwitch('s2', cls=OVSSwitch, dpid='2')
 
         # router
-        s3 = self.addSwitch('s3',cls=OVSSwitch)
+        s3 = self.addSwitch('s3',cls=OVSSwitch, dpid='3')
 
         link_opt = dict(bw=15, delay='10ms')
         # creating host links
