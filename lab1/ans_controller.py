@@ -6,27 +6,37 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp, ether_types,icmp
 
 
-class SDNRouter(app_manager.RyuApp):
+class LearningRouterSwitch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(SDNRouter, self).__init__(*args, **kwargs)
+        super(LearningRouterSwitch, self).__init__(*args, **kwargs)
 
         self.mac_to_port = {}
         self.arp_table = {}
 
-        # routing (s3 ports)
-        self.routes = {
+        self.subnet_ip_port_mapping = {
             "10.0.1.": 1,
             "10.0.2.": 2,
             "192.168.1.": 3
         }
 
-        # router interface MACs (REAL, not fake logic)
-        self.router_mac = {
+        self.router_port_mac_mapping = {
             1: "aa:aa:aa:aa:aa:01",
             2: "aa:aa:aa:aa:aa:02",
             3: "aa:aa:aa:aa:aa:03"
+        }
+
+        self.gateway_ip_mac_mapping ={
+                "10.0.1.1": "aa:aa:aa:aa:aa:01",
+                "10.0.2.1": "aa:aa:aa:aa:aa:02",
+                "192.168.1.1": "aa:aa:aa:aa:aa:03"
+            }
+
+        self.gateway_ip_port_mapping = {
+            1: "10.0.1.1",
+            2: "10.0.2.1",
+            3: "192.168.1.1"
         }
 
         # buffer packets until ARP resolution
@@ -54,8 +64,13 @@ class SDNRouter(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         # Construct flow_mod message and send it
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                match=match, instructions=inst)
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            instructions=inst
+        )
+
         datapath.send_msg(mod)
 
     # Handle the packet in event
@@ -80,10 +95,10 @@ class SDNRouter(app_manager.RyuApp):
             return
 
         #  Ignore multicast MAC addresses
-        #if eth_pkt.dst.startswith("33:33") or eth_pkt.dst == "ff:ff:ff:ff:ff:ff":
-        #    # Allow ARP broadcast only (handled below)
-        #    if eth_type != ether_types.ETH_TYPE_ARP:
-        #        return
+        if eth_pkt.dst.startswith("33:33") or eth_pkt.dst == "ff:ff:ff:ff:ff:ff":
+            # Allow ARP broadcast only (handled below)
+            if eth_type != ether_types.ETH_TYPE_ARP:
+                return
 
         if dpid == 3:
             self.logger.info("Packet in handler for Router")
@@ -116,26 +131,28 @@ class SDNRouter(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(out_port)]
 
         if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port,eth_dst=dst)
+            match = parser.OFPMatch(
+                in_port=in_port,
+                eth_dst=dst
+            )
             self.add_flow(dp, 1, match, actions)
             self.logger.info("Flow added for Switch:%s Src:%s Dst:%s Port:%s", dpid, src, dst, in_port)
 
         out = parser.OFPPacketOut(datapath=dp,
                                   buffer_id=ofproto.OFP_NO_BUFFER,
-                                  in_port=in_port, actions=actions,
-                                  data=msg.data)
+                                  in_port=in_port,
+                                  actions=actions,
+                                  data=msg.data
+                                  )
         dp.send_msg(out)
         self.logger.info("packet in handler done for Switch %s", dpid)
 
     def handle_router(self, dp, pkt, msg):
-        parser = dp.ofproto_parser
-        ofp = dp.ofproto
         in_port = msg.match['in_port']
-
-        eth = pkt.get_protocol(ethernet.ethernet)
         ip = pkt.get_protocol(ipv4.ipv4)
         arp_pkt = pkt.get_protocol(arp.arp)
         icmp_pkt = pkt.get_protocol(icmp.icmp)
+        parser = dp.ofproto_parser
 
         if arp_pkt:
             self.logger.info("Arp handler begin")
@@ -148,20 +165,67 @@ class SDNRouter(app_manager.RyuApp):
 
         src_ip = ip.src
         dst_ip = ip.dst
+        is_tcp_udp = ip.proto in [6, 17]
+        self.logger.info("packet in Router src_ip:%s dst_ip:%s is_tcp_udp:%s", src_ip, dst_ip, is_tcp_udp)
 
         # handle self gateway ping only
-        if dst_ip in self.get_gateway_ips_with_mac() and self.is_self_gateway(src_ip, dst_ip):
+        if dst_ip in self.gateway_ip_mac_mapping and self.is_self_gateway(src_ip, dst_ip):
             if icmp_pkt and icmp_pkt.type == icmp.ICMP_ECHO_REQUEST:
                 self.reply_icmp(dp, pkt, msg, in_port)
                 return
 
-        # firewall rule external should not ping internal servers
+        # ext cannot access internal
         if src_ip.startswith("192.168.1.") and dst_ip.startswith("10."):
+            match = parser.OFPMatch(
+                eth_type=0x0800,
+                ipv4_src=src_ip,
+                ipv4_dst=dst_ip
+            )
+
+            self.add_flow(dp, 100, match, [])
+            self.logger.info("DROP ext -> internal")
             return
 
-        # find route
+        # internal cannot access ext
+        if src_ip.startswith("10.") and dst_ip.startswith("192.168.1."):
+            match = parser.OFPMatch(
+                eth_type=0x0800,
+                ipv4_src=src_ip,
+                ipv4_dst=dst_ip
+            )
+
+            self.add_flow(dp, 100, match, [])
+            self.logger.info("DROP internal -> ext")
+            return
+
+        # TCP/UDP allowed ONLY between h1 and h2
+        if is_tcp_udp:
+
+            allowed_hosts = ["10.0.1.2", "10.0.1.3"]
+            expr = not (src_ip in allowed_hosts) or not (dst_ip in allowed_hosts)
+            self.logger.info(expr)
+            if not (src_ip in allowed_hosts) or not (dst_ip in allowed_hosts):
+                match = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=ip.proto,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip
+                )
+
+                self.add_flow(dp, 100, match, [])
+
+                self.logger.info(
+                    "DROP TCP/UDP src=%s dst=%s proto=%s",
+                    src_ip,
+                    dst_ip,
+                    ip.proto
+                )
+
+                return
+
+        # find output route
         out_port = None
-        for subnet, port in self.routes.items():
+        for subnet, port in self.subnet_ip_port_mapping.items():
             if dst_ip.startswith(subnet):
                 out_port = port
                 break
@@ -169,7 +233,7 @@ class SDNRouter(app_manager.RyuApp):
         if not out_port:
             return
 
-        # learn MAC first (critical fix)
+        # learn MAC for destination IP
         if dst_ip not in self.arp_table:
             self.trigger_arp(dp, out_port, dst_ip)
             self.buffer.setdefault(dst_ip, []).append((dp, msg))
@@ -182,25 +246,26 @@ class SDNRouter(app_manager.RyuApp):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
         arp_pkt = pkt.get_protocol(arp.arp)
-        # learn all IP-MAC mappings
+
+        # store ip-mac mappings
         self.arp_table[arp_pkt.src_ip] = arp_pkt.src_mac
         self.logger.info("ARP table: %s", self.arp_table)
 
         # reply for gateway
         if arp_pkt.opcode == arp.ARP_REQUEST:
             self.logger.info("ARP request for %s", arp_pkt.dst_ip)
-            if arp_pkt.dst_ip in self.get_gateway_ips_with_mac():
+            if arp_pkt.dst_ip in self.gateway_ip_mac_mapping:
 
-                mac = self.get_gateway_ips_with_mac()[arp_pkt.dst_ip]
+                mac = self.gateway_ip_mac_mapping[arp_pkt.dst_ip]
                 self.logger.info("ARP reply begin")
-                reply = packet.Packet()
-                reply.add_protocol(ethernet.ethernet(
+                arp_reply = packet.Packet()
+                arp_reply.add_protocol(ethernet.ethernet(
                     ethertype=0x0806,
                     dst=arp_pkt.src_mac,
                     src=mac
                 ))
 
-                reply.add_protocol(arp.arp(
+                arp_reply.add_protocol(arp.arp(
                     opcode=arp.ARP_REPLY,
                     src_mac=mac,
                     src_ip=arp_pkt.dst_ip,
@@ -208,14 +273,14 @@ class SDNRouter(app_manager.RyuApp):
                     dst_ip=arp_pkt.src_ip
                 ))
 
-                reply.serialize()
+                arp_reply.serialize()
 
                 out = parser.OFPPacketOut(
                     datapath=dp,
                     buffer_id=ofp.OFP_NO_BUFFER,
                     in_port=ofp.OFPP_CONTROLLER,
                     actions=[parser.OFPActionOutput(in_port)],
-                    data=reply.data
+                    data=arp_reply.data
                 )
                 dp.send_msg(out)
                 self.logger.info("ARP reply done")
@@ -234,17 +299,17 @@ class SDNRouter(app_manager.RyuApp):
 
         arp_req = packet.Packet()
 
-        self.logger.info("Triggering ARP from src_mac: %s, src_ip= %s for %s", self.router_mac[port], self.get_gatewayip_by_port(port), dst_ip)
+        self.logger.info("Triggering ARP from src_mac: %s, src_ip= %s for %s", self.router_port_mac_mapping[port], self.gateway_ip_port_mapping[port], dst_ip)
         arp_req.add_protocol(ethernet.ethernet(
             ethertype=0x0806,
-            src=self.router_mac[port],
+            src=self.router_port_mac_mapping[port],
             dst="ff:ff:ff:ff:ff:ff"
         ))
 
         arp_req.add_protocol(arp.arp(
             opcode=arp.ARP_REQUEST,
-            src_mac=self.router_mac[port],
-            src_ip=self.get_gatewayip_by_port(port),
+            src_mac=self.router_port_mac_mapping[port],
+            src_ip=self.gateway_ip_port_mapping[port],
             dst_mac="00:00:00:00:00:00",
             dst_ip=dst_ip
         ))
@@ -262,12 +327,11 @@ class SDNRouter(app_manager.RyuApp):
 
     def forward_packet(self, dp, msg, in_port, out_port, src_ip, dst_ip):
         self.logger.info("Forwarding packet from src_ip:%s  in_port:%s to dst_ip:%s out_port:%s", src_ip,in_port,dst_ip,out_port)
-        self.logger.info("Packet: %s", msg.data)
         parser = dp.ofproto_parser
         ofp = dp.ofproto
 
+        src_mac = self.router_port_mac_mapping[out_port]
         dst_mac = self.arp_table[dst_ip]
-        src_mac = self.router_mac[out_port]
 
         actions = [
             parser.OFPActionSetField(eth_src=src_mac),
@@ -282,8 +346,8 @@ class SDNRouter(app_manager.RyuApp):
             ipv4_dst=dst_ip
         )
 
-        self.logger.info("Flow added for Switch:%s Src:%s Dst:%s Port:%s", dp.id, src_mac, dst_mac, out_port)
-        self.add_flow(dp, 10, match, actions)
+        #self.logger.info("Flow added for Switch:%s Src:%s Dst:%s Port:%s", dp.id, src_mac, dst_mac, out_port)
+        #self.add_flow(dp, 10, match, actions)
 
         out = parser.OFPPacketOut(
             datapath=dp,
@@ -304,25 +368,22 @@ class SDNRouter(app_manager.RyuApp):
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         icmp_pkt = pkt.get_protocol(icmp.icmp)
 
-        gateway_mac = self.get_gateway_ips_with_mac()[ip_pkt.dst]
+        gateway_mac = self.gateway_ip_mac_mapping[ip_pkt.dst]
 
         reply = packet.Packet()
 
-        # ethernet
         reply.add_protocol(ethernet.ethernet(
             ethertype=0x0800,
             src=gateway_mac,
             dst=eth.src
         ))
 
-        # ip
         reply.add_protocol(ipv4.ipv4(
-            dst=ip_pkt.src,
             src=ip_pkt.dst,
+            dst=ip_pkt.src,
             proto=1
         ))
 
-        # icmp echo reply
         reply.add_protocol(icmp.icmp(
             type_=icmp.ICMP_ECHO_REPLY,
             code=0,
@@ -341,21 +402,6 @@ class SDNRouter(app_manager.RyuApp):
         )
 
         dp.send_msg(out)
-
-    def get_gateway_ips_with_mac(self):
-        return {
-            "10.0.1.1": "aa:aa:aa:aa:aa:01",
-            "10.0.2.1": "aa:aa:aa:aa:aa:02",
-            "192.168.1.1": "aa:aa:aa:aa:aa:03"
-        }
-
-    def get_gatewayip_by_port(self, port):
-        if port == 1:
-            return "10.0.1.1"
-        if port == 2:
-            return "10.0.2.1"
-        if port == 3:
-            return "192.168.1.1"
 
     def is_self_gateway(self, src_ip, dst_ip):
         parts = src_ip.split('.')
