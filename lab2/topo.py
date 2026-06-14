@@ -1,71 +1,53 @@
-"""
- Copyright (c) 2025 Computer Networks Group @ UPB
+from mininet.topo import Topo
 
- Permission is hereby granted, free of charge, to any person obtaining a copy of
- this software and associated documentation files (the "Software"), to deal in
- the Software without restriction, including without limitation the rights to
- use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
- the Software, and to permit persons to whom the Software is furnished to do so,
- subject to the following conditions:
+class FatTreeTopo(Topo):
+    def __init__(self, k=4, **opts):
+        super(FatTreeTopo, self).__init__(**opts)
+        self.k = k
+        cr_sw_maps = {}
+        agg_sw_maps = {}
+        edg_sw_maps = {}
+        sw_cn = 1
 
- The above copyright notice and this permission notice shall be included in all
- copies or substantial portions of the Software.
+        # Generate core switches
+        for j in range(1, (k // 2) + 1):
+            for i in range(1, (k // 2) + 1):
+                sw_name = f'cs{sw_cn}'
+                self.addSwitch(sw_name)
+                cr_sw_maps[(j, i)] = sw_name
+                sw_cn += 1
 
- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
- FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
- COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
- IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- """
+        # Generate switches for pods
+        for p in range(k):
+            # Create Aggregation Switches for Pod p
+            for s in range(k // 2, k):
+                sw_name = f'as{sw_cn}'
+                self.addSwitch(sw_name)
+                agg_sw_maps[(p, s)] = sw_name
+                sw_cn += 1
 
-# Class for an edge in the graph
-class Edge:
-	def __init__(self):
-		self.lnode = None
-		self.rnode = None
-	
-	def remove(self):
-		self.lnode.edges.remove(self)
-		self.rnode.edges.remove(self)
-		self.lnode = None
-		self.rnode = None
+                # Connect agg and core switches based on stride rules
+                str_rl = s - (k // 2)
+                for i in range(1, (k // 2) + 1):
+                    cr_sw_name = cr_sw_maps[(str_rl + 1, i)]
+                    self.addLink(sw_name, cr_sw_name, bw=15, delay='5ms')
 
-# Class for a node in the graph
-class Node:
-	def __init__(self, id, type):
-		self.edges = []
-		self.id = id
-		self.type = type
+            # Create Edge Switches for Pod p
+            for s in range(0, k // 2):
+                sw_name = f'es{sw_cn}'
+                self.addSwitch(sw_name)
+                edg_sw_maps[(p, s)] = sw_name
+                sw_cn += 1
 
-	# Add an edge connected to another node
-	def add_edge(self, node):
-		edge = Edge()
-		edge.lnode = self
-		edge.rnode = node
-		self.edges.append(edge)
-		node.edges.append(edge)
-		return edge
+                # Connect edge and aggregate switches
+                for agg_s in range(k // 2, k):
+                    agg_sw_name = agg_sw_maps[(p, agg_s)]
+                    self.addLink(sw_name, agg_sw_name, bw=15, delay='5ms')
 
-	# Remove an edge from the node
-	def remove_edge(self, edge):
-		self.edges.remove(edge)
-
-	# Decide if another node is a neighbor
-	def is_neighbor(self, node):
-		for edge in self.edges:
-			if edge.lnode == node or edge.rnode == node:
-				return True
-		return False
-
-
-class Fattree:
-
-	def __init__(self, num_ports):
-		self.servers = []
-		self.switches = []
-		self.generate(num_ports)
-
-	def generate(self, num_ports):
-
-		# TODO: code for generating the fat-tree topology
+                # Create host for edge switches
+                for h_id in range(2, (k // 2) + 2):
+                    host_name = f'h{p}{s}{h_id}'
+                    host_ip = f'10.{p}.{s}.{h_id}'
+                    host_mac = f'00:00:00:{p:02x}:{s:02x}:{h_id:02x}'
+                    host = self.addHost(host_name, ip=host_ip + '/8', mac=host_mac)
+                    self.addLink(sw_name, host, bw=15, delay='5ms')
