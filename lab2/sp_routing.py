@@ -36,6 +36,9 @@ class ShortestPathRouting(app_manager.RyuApp):
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
         self.update_topology()
+        self.logger.info("Topology data received from Topology API App")
+        for dpid in self.sw_adj_lst:
+            self.logger.info("Switch %d: Adjacency list %s", dpid, str(self.sw_adj_lst[dpid]))
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -68,18 +71,21 @@ class ShortestPathRouting(app_manager.RyuApp):
         if arp_pkt:
             src_ip = arp_pkt.src_ip
             dst_ip = arp_pkt.dst_ip
-
+            is_arp_req = False
             if arp_pkt.opcode == arp.ARP_REQUEST:
                 arp_key = (src_ip, dst_ip, dp.id)
+                is_arp_req = True
                 if arp_key in self.arp_trck:
                     return
                 self.arp_trck[arp_key] = True
+                self.logger.info("ARP request from %s to %s via switch %d", src_ip, dst_ip,dp.id)
             elif arp_pkt.opcode == arp.ARP_REPLY:
                 keys_to_clear = [k for k in self.arp_trck.keys() if k[0] == dst_ip and k[1] == src_ip]
+                self.logger.info("ARP reply from %s to %s via switch %d", src_ip, dst_ip,dp.id)
                 for k in keys_to_clear:
                     self.arp_trck.pop(k, None)
 
-            self.handle_arp(dp, in_port, pkt, eth, arp_pkt)
+            self.handle_arp(dp, in_port, pkt, eth, arp_pkt,is_arp_req)
             return
 
         if ip_pkt:
@@ -94,16 +100,20 @@ class ShortestPathRouting(app_manager.RyuApp):
                     break
 
             if target_dpid is None:
+                self.logger.info("No target dpid found to %s via switch %d for ip_pkt. Flooding via incoming port %d", dst_ip, dp.id,in_port)
                 self.flood(dp, in_port, eth, msg.data)
                 return
 
             if dp.id == target_dpid:
                 out_port = target_out_port
             else:
+                self.logger.info("Finding Shortest path from %d to %d", dp.id,target_dpid)
                 path = self.get_sp_djk(dp.id, target_dpid)
                 if not path or len(path) < 2:
+                    self.logger.info("No Shortest path from %d to %d. Flooding via incoming port %d", dp.id,target_dpid,in_port)
                     self.flood(dp, in_port, eth, msg.data)
                     return
+                self.logger.info("Shortest path from %d to %d is %s", dp.id,target_dpid,str(path))
                 next_hop = path[1]
                 out_port = self.sw_adj_lst[dp.id][next_hop]
 
@@ -149,6 +159,13 @@ class ShortestPathRouting(app_manager.RyuApp):
     def get_sp_djk(self, src_dpid, dst_dpid):
         if src_dpid not in self.sw_adj_lst or dst_dpid not in self.sw_adj_lst:
             return None
+
+        # --- FIX 1: FORCE BI-DIRECTIONAL PATH SYMMETRY ---
+        # Always run Dijkstra from the smaller DPID to the larger DPID
+        is_reversed = src_dpid > dst_dpid
+        s_node = dst_dpid if is_reversed else src_dpid
+        d_node = src_dpid if is_reversed else dst_dpid
+
         dst_lst = {}
         parent_lst = {}
 
@@ -156,36 +173,50 @@ class ShortestPathRouting(app_manager.RyuApp):
             dst_lst[node] = float('inf')
             parent_lst[node] = None
 
-        dst_lst[src_dpid] = 0
+        dst_lst[s_node] = 0
         uv_nodes = list(self.sw_adj_lst.keys())
 
         while uv_nodes:
-            cur_node = min(uv_nodes, key=lambda node: dst_lst[node])
+            # --- FIX 2: DETERMINISTIC TIE-BREAKING FOR MULTIPLE PATHS ---
+            # Sorting uv_nodes ensures that if two nodes have equal distance,
+            # the tie-break is consistently decided by numerical DPID order.
+            cur_node = min(sorted(uv_nodes), key=lambda node: dst_lst[node])
             uv_nodes.remove(cur_node)
 
-            if dst_lst[cur_node] == float('inf') or cur_node == dst_dpid:
+            if dst_lst[cur_node] == float('inf') or cur_node == d_node:
                 break
 
-            for neighbor in self.sw_adj_lst.get(cur_node, {}):
+            # --- FIX 3: DETERMINISTIC NEIGHBOR ITERATION ---
+            # Sorting the neighbor keys removes any dependency on the
+            # asynchronous order in which Ryu populated the adjacency dict.
+            for neighbor in sorted(self.sw_adj_lst.get(cur_node, {}).keys()):
                 new_dist = dst_lst[cur_node] + 1
                 if new_dist < dst_lst.get(neighbor, float('inf')):
                     dst_lst[neighbor] = new_dist
                     parent_lst[neighbor] = cur_node
 
+        # Reconstruct path from s_node to d_node
         path = []
-        curr = dst_dpid
+        curr = d_node
         while curr is not None:
             path.insert(0, curr)
             curr = parent_lst[curr]
-        return path if path and path[0] == src_dpid else None
 
-    def handle_arp(self, dp, in_port, pkt, eth_pkt, arp_pkt):
+        # If a valid path was found, adjust orientation based on who initiated the request
+        if path and path[0] == s_node:
+            if is_reversed:
+                path.reverse()  # Mirror the path back to the actual src->dst direction
+            return path
+        return None
+
+    def handle_arp(self, dp, in_port, pkt, eth_pkt, arp_pkt,is_arp_req):
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
         target_ip = arp_pkt.dst_ip
 
         target_dpid = None
         target_port = None
+        artype = "Request" if is_arp_req else "Reply"
         for dpid, hosts in self.edsw_host_port_lst.items():
             if target_ip in hosts:
                 target_dpid = dpid
@@ -196,10 +227,13 @@ class ShortestPathRouting(app_manager.RyuApp):
             if dp.id == target_dpid:
                 out_port = target_port
             else:
+                self.logger.info("Arp %s. Finding Shortest path from %d to %d",artype, dp.id, target_dpid)
                 path = self.get_sp_djk(dp.id, target_dpid)
                 if not path or len(path) < 2:
+                    self.logger.info("Arp %s.No Shortest path from %d to %d. Flooding via incoming port %d",artype, dp.id,target_dpid, in_port)
                     self.flood(dp, in_port, eth_pkt, pkt.data)
                     return
+                self.logger.info("Arp %s.Shortest path from %d to %d is %s",artype, dp.id, target_dpid, str(path))
                 next_hop = path[1]
                 out_port = self.sw_adj_lst[dp.id][next_hop]
 
@@ -208,6 +242,7 @@ class ShortestPathRouting(app_manager.RyuApp):
                                       in_port=in_port, actions=actions, data=pkt.data)
             dp.send_msg(out)
         else:
+            self.logger.info("Arp %s.No target dpid found to %s via switch %d for arp_pkt. Flooding via incoming port %d",artype,target_ip, dp.id, in_port)
             self.flood(dp, in_port, eth_pkt, pkt.data)
 
     def flood(self, dp, in_port, eth_pkt, data=None):
